@@ -379,7 +379,7 @@
 
   <header>
     <h1>PANIERE<span style="color:var(--text-dim)"> :: </span>FTSE MIB<span class="blink" style="color:var(--amber)">_</span></h1>
-    <div class="subtitle">Monitor simulato &middot; 100 EUR x titolo &middot; alert +10% / -5%</div>
+    <div class="subtitle">Monitor simulato &middot; 100 EUR x titolo &middot; vendita auto a +10% &middot; reinvesto cassa &ge; 100 EUR su momentum positivo</div>
   </header>
 
   <div class="controls">
@@ -425,6 +425,7 @@
             <tr>
               <th>Ticker</th>
               <th>Nome</th>
+              <th>Stato</th>
               <th class="num">P. acquisto</th>
               <th class="num">P. attuale</th>
               <th class="num">Δ %</th>
@@ -435,6 +436,26 @@
             </tr>
           </thead>
           <tbody id="tbody"></tbody>
+        </table>
+      </div>
+
+      <div class="table-wrap" id="tx-wrap" style="margin-top:16px">
+        <div style="padding:10px 14px;font-family:'VT323',monospace;font-size:18px;color:var(--amber);letter-spacing:1.2px;border-bottom:1px solid var(--border)">
+          ◢ TRANSAZIONI (ULTIME 15)
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Tipo</th>
+              <th>Ticker</th>
+              <th class="num">Prezzo</th>
+              <th class="num">Quantità</th>
+              <th class="num">Importo</th>
+              <th>Motivo</th>
+            </tr>
+          </thead>
+          <tbody id="tx-body"></tbody>
         </table>
       </div>
 
@@ -517,9 +538,10 @@ const TICKERS = [
   { id: "MB",    nome: "Mediobanca",       yahoo: "MB.MI",    stooq: "mb.it" },
 ];
 
-const BUDGET = 100;           // EUR per titolo
-const ALERT_UP = 0.10;        // +10%
-const ALERT_DOWN = -0.05;     // -5%
+const BUDGET = 100;           // EUR per titolo iniziali
+const ALERT_UP = 0.10;        // +10% → vendita automatica del lotto
+const ALERT_DOWN = -0.05;     // -5% → solo alert visivo (niente vendita)
+const SOGLIA_CASSA = 100;     // EUR: sopra questa soglia si reinveste
 const STORAGE_KEY = "paniere_ftsemib_v1";
 
 // Proxy CORS pubblici. L'ordine conta: il primo viene provato prima.
@@ -562,7 +584,16 @@ let chart = null;
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    // Migrazione campi introdotti dopo la v1
+    if (typeof s.cassa !== "number") s.cassa = 0;
+    if (typeof s.profittiRealizzati !== "number") s.profittiRealizzati = 0;
+    if (!Array.isArray(s.transazioni)) s.transazioni = [];
+    for (const pos of s.posizioni) {
+      if (!pos.stato) pos.stato = "active";
+    }
+    return s;
   } catch { return null; }
 }
 function saveState() {
@@ -759,22 +790,32 @@ async function runDiag() {
 // COMANDI
 // ==========================================================================
 
-async function cmdInit() {
+async function cmdInit(force = false) {
   if (state && !confirm("Paniere già inizializzato. Sovrascrivere?")) return;
   const prezzi = await fetchTutti();
   if (!prezzi) return;
   const now = new Date().toISOString();
+  const transazioni = [];
   state = {
     creato: now,
+    cassa: 0,
+    profittiRealizzati: 0,
+    transazioni,
     posizioni: TICKERS.map((t) => {
       const p = prezzi[t.id];
       if (!p) return null;
+      const qty = BUDGET / p;
+      transazioni.push({
+        tipo: "buy", ticker: t.id, prezzo: p, quantita: qty,
+        importo: BUDGET, ts: now, motivo: "init",
+      });
       return {
         ticker: t.id,
         nome: t.nome,
         prezzoAcquisto: p,
-        quantita: BUDGET / p,
+        quantita: qty,
         acquistatoIl: now,
+        stato: "active",
         storico: [{ ts: now, prezzo: p }],
       };
     }).filter(Boolean),
@@ -788,10 +829,82 @@ async function cmdCheck() {
   const prezzi = await fetchTutti();
   if (!prezzi) { render(); return; }
   const now = new Date().toISOString();
+
+  // 1) Aggiorna storico prezzi (per tutti, anche per i ticker "sold", perché il
+  //    prezzo di mercato esiste indipendentemente dal fatto che lo deteniamo).
   for (const pos of state.posizioni) {
     const p = prezzi[pos.ticker];
     if (p) pos.storico.push({ ts: now, prezzo: p });
   }
+
+  // 2) Vendita automatica per i lotti attivi che hanno toccato +10% vs acquisto.
+  //    I ticker venduti in questo check sono esclusi dal reinvestimento sottostante
+  //    (per evitare wash-trading immediato).
+  const appenaVenduti = new Set();
+  for (const pos of state.posizioni) {
+    if (pos.stato !== "active") continue;
+    const p = prezzi[pos.ticker];
+    if (!p) continue;
+    const delta = (p - pos.prezzoAcquisto) / pos.prezzoAcquisto;
+    if (delta >= ALERT_UP) {
+      const ricavato = p * pos.quantita;
+      const costo = pos.prezzoAcquisto * pos.quantita;
+      state.cassa += ricavato;
+      state.profittiRealizzati += (ricavato - costo);
+      state.transazioni.push({
+        tipo: "sell", ticker: pos.ticker, prezzo: p,
+        quantita: pos.quantita, importo: ricavato, ts: now,
+        motivo: `alert +${(delta * 100).toFixed(2)}%`,
+      });
+      pos.stato = "sold";
+      pos.quantita = 0;
+      pos.prezzoAcquisto = null;
+      pos.acquistatoIl = null;
+      appenaVenduti.add(pos.ticker);
+    }
+  }
+
+  // 3) Reinvestimento: se cassa ≥ soglia, cerca candidati con momentum positivo
+  //    (prezzo ultimo > prezzo del check precedente) e spalma la cassa equamente.
+  if (state.cassa >= SOGLIA_CASSA) {
+    const candidati = state.posizioni.filter((pos) => {
+      if (appenaVenduti.has(pos.ticker)) return false;           // no wash-trading
+      if (pos.storico.length < 2) return false;                   // serve un precedente
+      const ultimo = pos.storico[pos.storico.length - 1].prezzo;
+      const penult = pos.storico[pos.storico.length - 2].prezzo;
+      return ultimo > penult;                                      // momentum positivo
+    });
+
+    if (candidati.length > 0) {
+      const cassaDaReinvestire = state.cassa;
+      const quota = cassaDaReinvestire / candidati.length;
+      for (const pos of candidati) {
+        const prezzoCorr = pos.storico[pos.storico.length - 1].prezzo;
+        const qtyNuova = quota / prezzoCorr;
+
+        if (pos.stato === "active") {
+          // Dollar-cost averaging sul lotto esistente
+          const qtyTot = pos.quantita + qtyNuova;
+          const costoTot = pos.prezzoAcquisto * pos.quantita + quota;
+          pos.prezzoAcquisto = costoTot / qtyTot;
+          pos.quantita = qtyTot;
+        } else {
+          // Riapre la posizione con un nuovo lotto
+          pos.stato = "active";
+          pos.prezzoAcquisto = prezzoCorr;
+          pos.quantita = qtyNuova;
+          pos.acquistatoIl = now;
+        }
+
+        state.transazioni.push({
+          tipo: "buy", ticker: pos.ticker, prezzo: prezzoCorr,
+          quantita: qtyNuova, importo: quota, ts: now, motivo: "reinvest",
+        });
+      }
+      state.cassa = 0;
+    }
+  }
+
   saveState();
   render();
 }
@@ -889,7 +1002,7 @@ function render() {
   empty.style.display = "none";
   dash.style.display = "block";
 
-  // Ultimo timestamp
+  // Ultimo timestamp globale dallo storico
   let ultimoTs = null;
   for (const p of state.posizioni) {
     const last = p.storico[p.storico.length - 1];
@@ -899,8 +1012,7 @@ function render() {
     ? `LAST FETCH: ${formatTime(ultimoTs)}`
     : "— nessun fetch ancora —";
 
-  // Totali
-  let totInvestito = 0, totAttuale = 0;
+  let totInvestitoAttivo = 0, totAttuale = 0;
   const alertList = [];
 
   const tbody = document.getElementById("tbody");
@@ -908,21 +1020,42 @@ function render() {
 
   for (const p of state.posizioni) {
     const last = p.storico[p.storico.length - 1];
-    const prezzoCorr = last ? last.prezzo : p.prezzoAcquisto;
-    const delta = (prezzoCorr - p.prezzoAcquisto) / p.prezzoAcquisto;
+    const prezzoCorr = last ? last.prezzo : null;
+
+    if (p.stato === "sold") {
+      // Riga grigia: nessun lotto attivo
+      tbody.insertAdjacentHTML("beforeend", `
+        <tr style="opacity:0.55">
+          <td class="ticker">${p.ticker}</td>
+          <td>${p.nome}</td>
+          <td><span class="tag" style="color:var(--text-dim)">SOLD</span></td>
+          <td class="num muted">—</td>
+          <td class="num">${prezzoCorr != null ? formatEur(prezzoCorr, 4) : "—"}</td>
+          <td class="num muted">—</td>
+          <td class="num muted">—</td>
+          <td class="num muted">—</td>
+          <td class="num muted">—</td>
+          <td></td>
+        </tr>
+      `);
+      continue;
+    }
+
+    // Attiva
     const investito = p.prezzoAcquisto * p.quantita;
-    const valore = prezzoCorr * p.quantita;
+    const valore = (prezzoCorr != null ? prezzoCorr : p.prezzoAcquisto) * p.quantita;
+    const delta = prezzoCorr != null ? (prezzoCorr - p.prezzoAcquisto) / p.prezzoAcquisto : 0;
     const pl = valore - investito;
-    totInvestito += investito;
+    totInvestitoAttivo += investito;
     totAttuale += valore;
 
     let alertTag = "";
     let rowClass = "";
-    if (delta >= ALERT_UP) {
+    if (prezzoCorr != null && delta >= ALERT_UP) {
       alertTag = '<span class="tag up">▲ RIALZO</span>';
       rowClass = "alert-row-up";
       alertList.push({ tipo: "up", ticker: p.ticker, nome: p.nome, delta });
-    } else if (delta <= ALERT_DOWN) {
+    } else if (prezzoCorr != null && delta <= ALERT_DOWN) {
       alertTag = '<span class="tag down">▼ RIBASSO</span>';
       rowClass = "alert-row-down";
       alertList.push({ tipo: "down", ticker: p.ticker, nome: p.nome, delta });
@@ -935,8 +1068,9 @@ function render() {
       <tr class="${rowClass}">
         <td class="ticker">${p.ticker}</td>
         <td>${p.nome}</td>
+        <td><span class="tag up" style="color:var(--green)">ACTIVE</span></td>
         <td class="num">${formatEur(p.prezzoAcquisto, 4)}</td>
-        <td class="num">${formatEur(prezzoCorr, 4)}</td>
+        <td class="num">${prezzoCorr != null ? formatEur(prezzoCorr, 4) : "—"}</td>
         <td class="num ${deltaClass}">${formatPct(delta)}</td>
         <td class="num muted">${p.quantita.toFixed(4)}</td>
         <td class="num">${formatEur(valore)} €</td>
@@ -946,27 +1080,32 @@ function render() {
     `);
   }
 
-  // Totali cards
-  const totEl = document.getElementById("totals");
-  const deltaTot = totAttuale - totInvestito;
-  const pctTot = totInvestito ? (deltaTot / totInvestito) : 0;
-  const plColor = deltaTot >= 0 ? "var(--green)" : "var(--red)";
-  totEl.innerHTML = `
+  // Totals cards: Investito attivo, Valore attivo, P/L non realizzato, Cassa, P/L realizzato
+  const deltaNonReal = totAttuale - totInvestitoAttivo;
+  const plNonRealColor = deltaNonReal >= 0 ? "var(--green)" : "var(--red)";
+  const plRealColor = state.profittiRealizzati >= 0 ? "var(--green)" : "var(--red)";
+  const cassaColor = state.cassa >= SOGLIA_CASSA ? "var(--green)" : "var(--amber)";
+
+  document.getElementById("totals").innerHTML = `
     <div class="tot-card">
-      <div class="label">Investito</div>
-      <div class="value">${formatEur(totInvestito)} €</div>
-    </div>
-    <div class="tot-card">
-      <div class="label">Valore attuale</div>
+      <div class="label">Valore attivo</div>
       <div class="value">${formatEur(totAttuale)} €</div>
     </div>
     <div class="tot-card">
-      <div class="label">P/L totale</div>
-      <div class="value" style="color:${plColor}">${deltaTot >= 0 ? "+" : ""}${formatEur(deltaTot)} € (${formatPct(pctTot)})</div>
+      <div class="label">P/L non realizzato</div>
+      <div class="value" style="color:${plNonRealColor}">${deltaNonReal >= 0 ? "+" : ""}${formatEur(deltaNonReal)} €</div>
+    </div>
+    <div class="tot-card">
+      <div class="label">Cassa (soglia ${SOGLIA_CASSA} €)</div>
+      <div class="value" style="color:${cassaColor}">${formatEur(state.cassa)} €</div>
+    </div>
+    <div class="tot-card">
+      <div class="label">P/L realizzato</div>
+      <div class="value" style="color:${plRealColor}">${state.profittiRealizzati >= 0 ? "+" : ""}${formatEur(state.profittiRealizzati)} €</div>
     </div>
   `;
 
-  // Alerts banner
+  // Banner alert (rialzo/ribasso) + notifica vendite/reinvestimenti recenti
   for (const a of alertList) {
     const cls = a.tipo === "up" ? "up" : "down";
     const icon = a.tipo === "up" ? "▲" : "▼";
@@ -980,10 +1119,35 @@ function render() {
     `);
   }
 
-  // Aggiorna select grafico
+  // Transazioni recenti: mostra le ultime 15
+  const txBody = document.getElementById("tx-body");
+  if (txBody) {
+    const txs = (state.transazioni || []).slice(-15).reverse();
+    if (txs.length === 0) {
+      txBody.innerHTML = `<tr><td colspan="7" class="muted" style="text-align:center;padding:14px">Nessuna transazione oltre l'init.</td></tr>`;
+    } else {
+      txBody.innerHTML = txs.map((tx) => {
+        const color = tx.tipo === "buy" ? "var(--green)" : "var(--amber)";
+        const label = tx.tipo === "buy" ? "▲ BUY" : "▼ SELL";
+        return `
+          <tr>
+            <td class="muted">${formatTime(tx.ts)}</td>
+            <td style="color:${color}">${label}</td>
+            <td class="ticker">${tx.ticker}</td>
+            <td class="num">${formatEur(tx.prezzo, 4)}</td>
+            <td class="num muted">${tx.quantita.toFixed(4)}</td>
+            <td class="num">${formatEur(tx.importo)} €</td>
+            <td class="muted">${tx.motivo}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+  }
+
+  // Aggiorna select grafico (solo posizioni con storico)
   const sel = document.getElementById("chart-ticker");
   const attuale = sel.value;
-  sel.innerHTML = '<option value="__ALL__">TUTTI (Δ%)</option>' +
+  sel.innerHTML = '<option value="__ALL__">TUTTI (Δ% vs ultimo acquisto)</option>' +
     state.posizioni.map(p => `<option value="${p.ticker}">${p.ticker} — ${p.nome}</option>`).join("");
   if (attuale) sel.value = attuale;
 
@@ -1099,21 +1263,89 @@ function submitManual() {
   const now = new Date().toISOString();
   if (!state) {
     // Init con questi prezzi
+    const transazioni = [];
     state = {
       creato: now,
-      posizioni: TICKERS.filter(t => prezzi[t.id]).map(t => ({
-        ticker: t.id,
-        nome: t.nome,
-        prezzoAcquisto: prezzi[t.id],
-        quantita: BUDGET / prezzi[t.id],
-        acquistatoIl: now,
-        storico: [{ ts: now, prezzo: prezzi[t.id] }],
-      })),
+      cassa: 0,
+      profittiRealizzati: 0,
+      transazioni,
+      posizioni: TICKERS.filter(t => prezzi[t.id]).map(t => {
+        const qty = BUDGET / prezzi[t.id];
+        transazioni.push({
+          tipo: "buy", ticker: t.id, prezzo: prezzi[t.id], quantita: qty,
+          importo: BUDGET, ts: now, motivo: "init-manual",
+        });
+        return {
+          ticker: t.id, nome: t.nome,
+          prezzoAcquisto: prezzi[t.id],
+          quantita: qty,
+          acquistatoIl: now,
+          stato: "active",
+          storico: [{ ts: now, prezzo: prezzi[t.id] }],
+        };
+      }),
     };
   } else {
-    // Aggiorna storico
+    // Aggiorna storico + applica logica vendita/reinvestimento come nel check normale
     for (const pos of state.posizioni) {
       if (prezzi[pos.ticker]) pos.storico.push({ ts: now, prezzo: prezzi[pos.ticker] });
+    }
+
+    const appenaVenduti = new Set();
+    for (const pos of state.posizioni) {
+      if (pos.stato !== "active") continue;
+      const p = prezzi[pos.ticker];
+      if (!p) continue;
+      const delta = (p - pos.prezzoAcquisto) / pos.prezzoAcquisto;
+      if (delta >= ALERT_UP) {
+        const ricavato = p * pos.quantita;
+        const costo = pos.prezzoAcquisto * pos.quantita;
+        state.cassa += ricavato;
+        state.profittiRealizzati += (ricavato - costo);
+        state.transazioni.push({
+          tipo: "sell", ticker: pos.ticker, prezzo: p,
+          quantita: pos.quantita, importo: ricavato, ts: now,
+          motivo: `alert +${(delta * 100).toFixed(2)}% (manuale)`,
+        });
+        pos.stato = "sold";
+        pos.quantita = 0;
+        pos.prezzoAcquisto = null;
+        pos.acquistatoIl = null;
+        appenaVenduti.add(pos.ticker);
+      }
+    }
+
+    if (state.cassa >= SOGLIA_CASSA) {
+      const candidati = state.posizioni.filter((pos) => {
+        if (appenaVenduti.has(pos.ticker)) return false;
+        if (pos.storico.length < 2) return false;
+        const ultimo = pos.storico[pos.storico.length - 1].prezzo;
+        const penult = pos.storico[pos.storico.length - 2].prezzo;
+        return ultimo > penult;
+      });
+      if (candidati.length > 0) {
+        const quota = state.cassa / candidati.length;
+        for (const pos of candidati) {
+          const prezzoCorr = pos.storico[pos.storico.length - 1].prezzo;
+          const qtyNuova = quota / prezzoCorr;
+          if (pos.stato === "active") {
+            const qtyTot = pos.quantita + qtyNuova;
+            const costoTot = pos.prezzoAcquisto * pos.quantita + quota;
+            pos.prezzoAcquisto = costoTot / qtyTot;
+            pos.quantita = qtyTot;
+          } else {
+            pos.stato = "active";
+            pos.prezzoAcquisto = prezzoCorr;
+            pos.quantita = qtyNuova;
+            pos.acquistatoIl = now;
+          }
+          state.transazioni.push({
+            tipo: "buy", ticker: pos.ticker, prezzo: prezzoCorr,
+            quantita: qtyNuova, importo: quota, ts: now, motivo: "reinvest-manual",
+          });
+        }
+        state.cassa = 0;
+      }
     }
   }
   saveState();
