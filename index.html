@@ -386,6 +386,8 @@
     <button id="btn-init" class="primary">▸ INIT</button>
     <button id="btn-check">↻ CHECK</button>
     <button id="btn-manual">⌨ MANUALE</button>
+    <button id="btn-diag">◈ DIAG</button>
+    <button id="btn-settings">⚙ KEY</button>
     <button id="btn-export">↓ EXPORT</button>
     <button id="btn-import">↑ IMPORT</button>
     <button id="btn-reset" class="danger">⌫ RESET</button>
@@ -451,7 +453,7 @@
   </div>
 
   <footer>
-    DATI: STOOQ.COM &middot; DELAY ~15 MIN &middot; STRUMENTO SIMULATIVO &middot; NON È CONSULENZA FINANZIARIA
+    DATI: YAHOO FINANCE / STOOQ (via CORS PROXY) &middot; DELAY ~15 MIN &middot; STRUMENTO SIMULATIVO &middot; NON È CONSULENZA FINANZIARIA
   </footer>
 </main>
 
@@ -468,29 +470,86 @@
   </div>
 </div>
 
+<!-- Modal diagnostica -->
+<div class="modal-backdrop" id="modal-diag">
+  <div class="modal">
+    <h3>◢ DIAGNOSTICA</h3>
+    <p>Testa ogni provider con il ticker ISP. Mostra esattamente quali canali funzionano da questo browser.</p>
+    <pre id="diag-output" style="background:#0a0a08;border:1px solid var(--border);padding:12px;font-size:11px;color:var(--text);max-height:380px;overflow:auto;white-space:pre-wrap;word-break:break-all">Premi "ESEGUI TEST"...</pre>
+    <div class="modal-actions">
+      <button onclick="document.getElementById('modal-diag').classList.remove('show')">CHIUDI</button>
+      <button class="primary" id="btn-run-diag">ESEGUI TEST</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal settings (API key) -->
+<div class="modal-backdrop" id="modal-settings">
+  <div class="modal">
+    <h3>◢ API KEY (OPZIONALE)</h3>
+    <p>Per evitare i capricci dei proxy CORS pubblici, puoi usare <strong>Twelve Data</strong>: registrazione gratuita su <span style="color:var(--amber)">twelvedata.com</span> (piano free: 800 richieste/giorno, 8/min). Incolla qui la API key e diventa il provider primario.</p>
+    <div style="margin-bottom:16px">
+      <input type="text" id="twelve-key-input" placeholder="API key Twelve Data" style="width:100%;padding:10px" />
+    </div>
+    <div class="modal-actions">
+      <button onclick="document.getElementById('modal-settings').classList.remove('show')">ANNULLA</button>
+      <button onclick="(() => { setTwelveKey(''); document.getElementById('twelve-key-input').value=''; setStatus('KEY RIMOSSA','amber'); document.getElementById('modal-settings').classList.remove('show'); })()">RIMUOVI</button>
+      <button class="primary" onclick="(() => { const k=document.getElementById('twelve-key-input').value.trim(); setTwelveKey(k); setStatus(k?'KEY SALVATA':'KEY VUOTA','green'); document.getElementById('modal-settings').classList.remove('show'); })()">SALVA</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ==========================================================================
 // CONFIGURAZIONE
 // ==========================================================================
 
 const TICKERS = [
-  { id: "ISP",   nome: "Intesa Sanpaolo" },
-  { id: "UCG",   nome: "UniCredit" },
-  { id: "ENEL",  nome: "Enel" },
-  { id: "RACE",  nome: "Ferrari" },
-  { id: "G",     nome: "Generali" },
-  { id: "ENI",   nome: "Eni" },
-  { id: "STLAM", nome: "Stellantis" },
-  { id: "PST",   nome: "Poste Italiane" },
-  { id: "PRY",   nome: "Prysmian" },
-  { id: "MB",    nome: "Mediobanca" },
+  { id: "ISP",   nome: "Intesa Sanpaolo",  yahoo: "ISP.MI",   stooq: "isp.it" },
+  { id: "UCG",   nome: "UniCredit",        yahoo: "UCG.MI",   stooq: "ucg.it" },
+  { id: "ENEL",  nome: "Enel",             yahoo: "ENEL.MI",  stooq: "enel.it" },
+  { id: "RACE",  nome: "Ferrari",          yahoo: "RACE.MI",  stooq: "race.it" },
+  { id: "G",     nome: "Generali",         yahoo: "G.MI",     stooq: "g.it" },
+  { id: "ENI",   nome: "Eni",              yahoo: "ENI.MI",   stooq: "eni.it" },
+  { id: "STLAM", nome: "Stellantis",       yahoo: "STLAM.MI", stooq: "stlam.it" },
+  { id: "PST",   nome: "Poste Italiane",   yahoo: "PST.MI",   stooq: "pst.it" },
+  { id: "PRY",   nome: "Prysmian",         yahoo: "PRY.MI",   stooq: "pry.it" },
+  { id: "MB",    nome: "Mediobanca",       yahoo: "MB.MI",    stooq: "mb.it" },
 ];
 
 const BUDGET = 100;           // EUR per titolo
 const ALERT_UP = 0.10;        // +10%
 const ALERT_DOWN = -0.05;     // -5%
 const STORAGE_KEY = "paniere_ftsemib_v1";
-const STOOQ_URL = (id) => `https://stooq.com/q/l/?s=${id.toLowerCase()}.it&f=sd2t2ohlcv&h&e=csv`;
+
+// Proxy CORS pubblici. L'ordine conta: il primo viene provato prima.
+// cors.lol è in testa perché dalla diagnostica risulta il più affidabile; gli altri
+// restano come fallback in caso di rate-limit o caduta momentanea.
+const CORS_PROXIES = [
+  { name: "cors.lol",     wrap: (url) => `https://api.cors.lol/?url=${encodeURIComponent(url)}` },
+  { name: "corsproxy.io", wrap: (url) => `https://corsproxy.io/?${encodeURIComponent(url)}` },
+  { name: "allorigins",   wrap: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
+  { name: "thingproxy",   wrap: (url) => `https://thingproxy.freeboard.io/fetch/${url}` },
+];
+
+// Sticky provider: ricorda l'ultima strategia che ha funzionato per saltarci subito
+// invece di rifare tutta la scala di fallback per ogni ticker.
+let lastWorkingProvider = null;
+
+// API key opzionale per Twelve Data (https://twelvedata.com — registrazione gratuita, 800 req/giorno)
+// Se presente, viene usata come provider primario (molto più affidabile dei proxy).
+const TWELVE_KEY_STORAGE = "paniere_twelve_key";
+function getTwelveKey() { return localStorage.getItem(TWELVE_KEY_STORAGE) || ""; }
+function setTwelveKey(k) { if (k) localStorage.setItem(TWELVE_KEY_STORAGE, k); else localStorage.removeItem(TWELVE_KEY_STORAGE); }
+
+// Log diagnostico
+const DEBUG_LOG = [];
+function dlog(...args) {
+  const msg = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
+  DEBUG_LOG.push(`[${new Date().toISOString().slice(11,19)}] ${msg}`);
+  if (DEBUG_LOG.length > 300) DEBUG_LOG.shift();
+  console.log("[paniere]", ...args);
+}
 
 // ==========================================================================
 // STATO
@@ -511,44 +570,189 @@ function saveState() {
 }
 
 // ==========================================================================
-// FETCH PREZZI (Stooq, CSV)
+// FETCH PREZZI — Multi-provider con diagnostica
 // ==========================================================================
 
-async function fetchPrezzo(id) {
-  try {
-    const res = await fetch(STOOQ_URL(id));
-    if (!res.ok) return null;
-    const text = await res.text();
-    // CSV: Symbol,Date,Time,Open,High,Low,Close,Volume
-    const lines = text.trim().split("\n");
-    if (lines.length < 2) return null;
-    const cols = lines[1].split(",");
-    const close = parseFloat(cols[6]);
-    return isNaN(close) || close <= 0 ? null : close;
-  } catch (e) {
-    console.error("fetch error", id, e);
-    return null;
-  }
+// Timeout helper per fetch (default 8s, più stretto per i proxy)
+function fetchT(url, ms = 8000) {
+  return Promise.race([
+    fetch(url),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("timeout " + ms + "ms")), ms)),
+  ]);
 }
 
+// Provider A: Twelve Data (se l'utente ha messo la key) — il più affidabile
+async function fetchTwelveData(ticker, key) {
+  const url = `https://api.twelvedata.com/price?symbol=${ticker}&apikey=${encodeURIComponent(key)}`;
+  const res = await fetchT(url, 8000);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const data = await res.json();
+  if (data.status === "error") throw new Error(data.message || "td error");
+  const price = parseFloat(data.price);
+  if (isNaN(price) || price <= 0) throw new Error("invalid price in response");
+  return price;
+}
+
+// Provider B: Yahoo Finance chart API
+async function fetchYahoo(ticker, proxy = null) {
+  const raw = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`;
+  const url = proxy ? proxy.wrap(raw) : raw;
+  const res = await fetchT(url, proxy ? 6000 : 8000);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); }
+  catch (e) { throw new Error("non-JSON response (primi 80 char: " + text.slice(0, 80) + ")"); }
+  const result = data?.chart?.result?.[0];
+  if (!result) {
+    const err = data?.chart?.error?.description || "no result";
+    throw new Error(err);
+  }
+  if (result?.meta?.regularMarketPrice) return result.meta.regularMarketPrice;
+  const closes = result?.indicators?.quote?.[0]?.close || [];
+  const last = closes.filter(v => v != null).pop();
+  if (last) return last;
+  throw new Error("no price in Yahoo response");
+}
+
+// Provider C: Stooq CSV (serve sempre il proxy)
+async function fetchStooq(stooqId, proxy) {
+  const raw = `https://stooq.com/q/l/?s=${stooqId}&f=sd2t2ohlcv&h&e=csv`;
+  const res = await fetchT(proxy.wrap(raw), 6000);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const text = await res.text();
+  const lines = text.trim().split("\n");
+  if (lines.length < 2) throw new Error("empty CSV (primi 80 char: " + text.slice(0, 80) + ")");
+  const cols = lines[1].split(",");
+  const close = parseFloat(cols[6]);
+  if (isNaN(close) || close <= 0) throw new Error("invalid close: " + cols[6]);
+  return close;
+}
+
+// Costruisce la lista ordinata di tentativi per un ticker.
+function buildAttempts(t) {
+  const key = getTwelveKey();
+  const attempts = [];
+  if (key) attempts.push({ name: "twelve", fn: () => fetchTwelveData(t.yahoo, key) });
+  attempts.push({ name: "yahoo-direct", fn: () => fetchYahoo(t.yahoo) });
+  for (const proxy of CORS_PROXIES) {
+    attempts.push({ name: "yahoo/" + proxy.name, fn: () => fetchYahoo(t.yahoo, proxy) });
+  }
+  for (const proxy of CORS_PROXIES) {
+    attempts.push({ name: "stooq/" + proxy.name, fn: () => fetchStooq(t.stooq, proxy) });
+  }
+  return attempts;
+}
+
+async function fetchPrezzo(t) {
+  const attempts = buildAttempts(t);
+
+  // Se un tentativo ha funzionato di recente, provalo per PRIMO.
+  if (lastWorkingProvider) {
+    const idx = attempts.findIndex(a => a.name === lastWorkingProvider);
+    if (idx > 0) {
+      const [sticky] = attempts.splice(idx, 1);
+      attempts.unshift(sticky);
+    }
+  }
+
+  for (const a of attempts) {
+    try {
+      const prezzo = await a.fn();
+      dlog(t.id, "OK via " + a.name);
+      lastWorkingProvider = a.name;
+      return { prezzo, src: a.name };
+    } catch (e) {
+      dlog(t.id, a.name + " FAIL:", e.message);
+    }
+  }
+
+  dlog(t.id, "ALL PROVIDERS FAILED");
+  return null;
+}
+
+// Piccolo delay per non saturare il proxy (rate limit).
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 async function fetchTutti() {
+  DEBUG_LOG.length = 0;
+  lastWorkingProvider = null; // reset a ogni ciclo pieno
+  dlog("=== fetchTutti start ===");
   setStatus("FETCH IN CORSO...", "amber");
+
   const results = {};
-  const promises = TICKERS.map(async (t) => {
-    results[t.id] = await fetchPrezzo(t.id);
-  });
-  await Promise.all(promises);
+  const sources = {};
+  let done = 0;
+  // Sequenziale + micro-delay: evita di triggerare rate-limit sul proxy pubblico
+  for (const t of TICKERS) {
+    const r = await fetchPrezzo(t);
+    if (r) { results[t.id] = r.prezzo; sources[t.id] = r.src; }
+    else   { results[t.id] = null; }
+    done++;
+    setStatus(`FETCH ${done}/${TICKERS.length} — ultimo: ${t.id}`, "amber");
+    await sleep(150);
+  }
+
+  const okCount = Object.values(results).filter(v => v !== null).length;
   const failed = Object.entries(results).filter(([, v]) => v === null).map(([k]) => k);
-  if (failed.length === TICKERS.length) {
-    setStatus("ERRORE: nessun dato (CORS o rete?). Usa MANUALE.", "red");
+  dlog("=== fetchTutti end === OK:", okCount, "/", TICKERS.length);
+
+  if (okCount === 0) {
+    setStatus("ERRORE: tutti i provider hanno fallito. Premi DIAG per dettagli.", "red");
     return null;
   }
   if (failed.length > 0) {
-    setStatus(`OK (${TICKERS.length - failed.length}/${TICKERS.length}) — mancanti: ${failed.join(", ")}`, "amber");
+    setStatus(`OK (${okCount}/${TICKERS.length}) — mancanti: ${failed.join(", ")}`, "amber");
   } else {
-    setStatus(`OK — tutti i prezzi aggiornati`, "green");
+    const srcs = [...new Set(Object.values(sources))].join(", ");
+    setStatus(`OK — ${okCount}/${TICKERS.length} via ${srcs}`, "green");
   }
   return results;
+}
+
+// ==========================================================================
+// DIAGNOSTICA — test rapido di connettività per ogni provider
+// ==========================================================================
+
+async function runDiag() {
+  const testTicker = TICKERS[0]; // ISP
+  const lines = [];
+  lines.push(`Test con ticker: ${testTicker.id} (${testTicker.yahoo} / ${testTicker.stooq})`);
+  lines.push("");
+
+  const key = getTwelveKey();
+  if (key) {
+    try {
+      const p = await fetchTwelveData(testTicker.yahoo, key);
+      lines.push(`✓ Twelve Data: OK (${p})`);
+    } catch (e) { lines.push(`✗ Twelve Data: ${e.message}`); }
+  } else {
+    lines.push(`— Twelve Data: (nessuna key configurata)`);
+  }
+
+  try {
+    const p = await fetchYahoo(testTicker.yahoo);
+    lines.push(`✓ Yahoo diretto: OK (${p})`);
+  } catch (e) { lines.push(`✗ Yahoo diretto: ${e.message}`); }
+
+  for (const proxy of CORS_PROXIES) {
+    try {
+      const p = await fetchYahoo(testTicker.yahoo, proxy);
+      lines.push(`✓ Yahoo via ${proxy.name}: OK (${p})`);
+    } catch (e) { lines.push(`✗ Yahoo via ${proxy.name}: ${e.message}`); }
+  }
+
+  for (const proxy of CORS_PROXIES) {
+    try {
+      const p = await fetchStooq(testTicker.stooq, proxy);
+      lines.push(`✓ Stooq via ${proxy.name}: OK (${p})`);
+    } catch (e) { lines.push(`✗ Stooq via ${proxy.name}: ${e.message}`); }
+  }
+
+  lines.push("");
+  lines.push("Log completo:");
+  lines.push(...DEBUG_LOG);
+  return lines.join("\n");
 }
 
 // ==========================================================================
@@ -935,6 +1139,27 @@ document.getElementById("btn-auto").addEventListener("click", () => {
   if (autoTimer) stopAuto(); else startAuto();
 });
 document.getElementById("chart-ticker").addEventListener("change", renderChart);
+
+// DIAG
+document.getElementById("btn-diag").addEventListener("click", () => {
+  document.getElementById("diag-output").textContent = 'Premi "ESEGUI TEST"...';
+  document.getElementById("modal-diag").classList.add("show");
+});
+document.getElementById("btn-run-diag").addEventListener("click", async () => {
+  const out = document.getElementById("diag-output");
+  out.textContent = "Test in corso...";
+  try {
+    out.textContent = await runDiag();
+  } catch (e) {
+    out.textContent = "Errore: " + e.message;
+  }
+});
+
+// SETTINGS (API key)
+document.getElementById("btn-settings").addEventListener("click", () => {
+  document.getElementById("twelve-key-input").value = getTwelveKey();
+  document.getElementById("modal-settings").classList.add("show");
+});
 
 // Render iniziale
 render();
